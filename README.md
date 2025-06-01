@@ -56,7 +56,7 @@ Run this single command in your terminal. It:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/robit-man/serveo-local-dev/main/server.py \
-  -o ~/serveo-launcher.py && chmod +x ~/serveo-launcher.py && python3 ~/serveo-launcher.py
+  -o ~/server.py && python3 ~/server.py
 ```
 
 * **What this does:**
