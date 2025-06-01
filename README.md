@@ -1,368 +1,299 @@
 # Serveo Local Development and Production Forwarder
 
-A step-by-step guide to get your Node.js app exposed locally (HTTPS) and to the world via Serveo.  This README covers both **DEV** mode (no DNS changes, random `*.serveo.net` host) and **PRODUCTION** mode (Cloudflare + custom subdomain).  Follow the instructions carefully to avoid the dreaded 502 error.
+A single-command installer + orchestrator for:
+- **DEV mode** → quick HTTPS (https://localhost:9443) + random `*.serveo.net` tunnel → your local Node.  
+- **PRODUCTION mode** → Cloudflare DNS (CNAME + TXT) + custom subdomain (e.g. `chat.yourdomain.com`) → Serveo tunnel → local Node.
+
+Everything lives in one Python script (`server.py`) on GitHub. This README shows you how to run it in a single shell line, and explains all the pieces if you need to troubleshoot.
 
 ---
 
-## Table of Contents
+## 📋 Prerequisites
 
-1. [Prerequisites](#prerequisites)
-2. [Repository Layout](#repository-layout)
-3. [Installing Dependencies](#installing-dependencies)
-4. [Running in DEV Mode](#running-in-dev-mode)
-5. [Running in PRODUCTION Mode (Cloudflare + Custom Subdomain)](#running-in-production-mode-cloudflare--custom-subdomain)
-
-   1. [Creating a Cloudflare API Token](#creating-a-cloudflare-api-token)
-   2. [Invoking the Script in Production Mode](#invoking-the-script-in-production-mode)
-   3. [DNS Records Automatically Set by the Script](#dns-records-automatically-set-by-the-script)
-   4. [Verifying Propagation & Testing](#verifying-propagation--testing)
-6. [How It Works: Key Points](#how-it-works-key-points)
-
-   1. [SSH Key & Fingerprint](#ssh-key--fingerprint)
-   2. [TXT Record Naming](#txt-record-naming)
-   3. [CNAME Target for Custom Domain](#cname-target-for-custom-domain)
-   4. [Custom-Domain SSH Command](#custom-domain-ssh-command)
-   5. [SSL Certificates + Local HTTPS](#ssl-certificates--local-https)
-7. [Troubleshooting](#troubleshooting)
-
-   1. [502 Errors from Cloudflare](#502-errors-from-cloudflare)
-   2. [“Unable to find active zone” Errors](#unable-to-find-active-zone-errors)
-   3. [SSL Certificate Issues](#ssl-certificate-issues)
-8. [Full Script Listing](#full-script-listing)
-9. [Appendix: Useful Links](#appendix-useful-links)
-
----
-
-## Prerequisites
-
-Before you begin, make sure you have:
-
-1. **Node.js** (v14.x or higher recommended)
-
-   * Confirm by running:
-
-     ```bash
-     node --version
-     npm --version
-     ```
-   * If you don’t have Node, download & install from [nodejs.org](https://nodejs.org/).
-
-2. **Python 3** (3.7+), plus `pip`
-
-   * Confirm by running:
-
-     ```bash
-     python3 --version
-     pip3 --version
-     ```
-   * If you don’t have Python 3 installed, install via your OS package manager or from [python.org](https://www.python.org/).
-
-3. **ssh** (OpenSSH client)
-
-   * Confirm:
-
-     ```bash
-     ssh -V
-     ```
-   * If missing, install your OS’s OpenSSH client package (e.g. `sudo apt install openssh-client` on Ubuntu).
-
-4. A **Cloudflare account** (for PRODUCTION mode) and access to the zone you intend to use (e.g. `hypermindlabs.org`).
-
-   * You will generate an **API Token** with “Edit zone DNS” permissions (see below).
-
-5. A **Namecheap** or other DNS registrar is *not needed* in PRODUCTION mode—everything is handled via Cloudflare.  (If you were using Namecheap’s API previously, drop all those records—our script has moved to Cloudflare exclusively.)
-
-6. A working **Node.js project** in the same folder (must contain `package.json` and `server.js`).  The script expects you have a typical Node app that listens on `process.env.PORT` (default 3000).
-
----
-
-## Repository Layout
-
-Assume the repo looks like this:
-
-```
-/my-app
-  ├── server.js
-  ├── package.json
-  ├── server.py          ← our Python orchestration script
-  ├── config.json        ← auto‐generated (stores “serve_path”)
-  ├── domain.conf        ← auto‐generated (stores dev/prod config)
-  └── venv/              ← virtualenv folder (Python dependencies)
+1. **Node.js & npm** (v14.x or higher).  
+   Confirm:  
+   ```bash
+   node --version 
+   npm --version
 ```
 
-* **`server.py`** is the orchestration script you’ll run.
-* **`server.js`** is your Node app entry (as usual).
-* **`domain.conf`** and **`config.json`** are created/updated by `server.py`.
+2. **Python 3** (≥ 3.7) and `pip`.
+   Confirm:
+
+   ```bash
+   python3 --version 
+   pip3 --version
+   ```
+
+3. **ssh (OpenSSH client)**
+   Confirm:
+
+   ```bash
+   ssh -V
+   ```
+
+4. **Cloudflare account** → for PRODUCTION mode. You’ll need to create an API Token with “Edit zone DNS” for your domain.
+   (See detailed steps below.)
+
+5. A **Node.js project** in the **same folder** as `server.py`, containing:
+
+   * `package.json`
+   * `server.js` (or equivalent entrypoint)
+
+   The Node app must read `process.env.PORT` and listen on that port. The script will set `PORT=<free_port>` before launching.
 
 ---
 
-## Installing Dependencies
+## 🚀 One-Line Installation & Run
 
-1. **Clone or copy** this repository (your Node app + `server.py`) to your local machine.
+Run this single command in your terminal. It:
 
-   ```bash
-   git clone https://github.com/your‐repo/my-app.git
-   cd my-app
-   ```
+1. Downloads `server.py` from GitHub
+2. Makes it executable
+3. Executes it under Python 3—auto-creating a `venv/` and installing `cryptography` & `requests`
+4. Prompts you to choose DEV vs PRODUCTION
+5. Proceeds with either random Serveo subdomain (DEV) or Cloudflare + custom domain (PROD).
 
-2. **Ensure your Node app files** (`package.json` and `server.js`) are present in this directory.
-
-3. **Make `server.py` executable** (if needed):
-
-   ```bash
-   chmod +x server.py
-   ```
-
-4. **Run `server.py`.** On its first execution, it will create a Python virtual environment and install the required Python packages (`cryptography` and `requests`).
-
-   ```bash
-   ./server.py
-   ```
-
-   You’ll see output like:
-
-   ```
-   Creating virtualenv… |
-   Installing dependencies… |
-   ```
-
-   After venv is ready, the script re‐executes inside the virtual environment.
-
-   * If you ever want to re‐install or upgrade Python deps, delete the `venv/` folder and re‐run `server.py`.
-
----
-
-## Running in DEV Mode
-
-Use **DEV mode** when you want:
-
-* A quick HTTPS endpoint on `localhost:9443` (certificate covers `localhost`, your LAN IP, and the ephemeral Serveo host).
-* A random subdomain like `abcdef1234.serveo.net` that tunnels to your local Node.
-* No DNS changes, no Cloudflare, no custom domain.
-
-### Steps
-
-1. Run the script:
-
-   ```bash
-   ./server.py
-   ```
-
-2. When prompted, choose:
-
-   ```
-   ⚠  Do you want to run in DEV mode or PRODUCTION mode?
-      1) DEV (no Cloudflare, just random Serveo subdomain)
-      2) PRODUCTION (Cloudflare + custom subdomain)
-   Enter 1 or 2: 1
-   ```
-
-3. The script will:
-
-   * Find a free port (3000, 3001, …) for your Node server.
-   * Install npm dependencies (`npm install`).
-   * Launch `npm run start` (expects your `package.json` to have a “start” script; sets `PORT=<chosen_port>`).
-   * Launch an SSH tunnel via Serveo:
-
-     ```
-     ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R 80:localhost:<port> serveo.net
-     ```
-
-     and parse Serveo’s output to get something like:
-
-     ```
-     Forwarding HTTP traffic from https://abcdef1234.serveo.net to localhost:3000
-     ```
-   * Generate a self‐signed (or mkcert) certificate covering:
-
-     * `localhost`
-     * `<your_lan_ip>`
-     * the random `abcdef1234.serveo.net`
-     * `127.0.0.1`
-   * Start a local HTTPS reverse‐proxy on port **9443** that forwards to your Node on `<port>`.
-   * Print a banner:
-
-     ```
-     ╔═══════════════════════════════════════════╗
-     ║  Node (HTTP)  → http://127.0.0.1:<port>    ║
-     ║  Local Dev    → https://localhost:9443    ║
-     ║  LAN Dev      → https://<LAN_IP>:9443     ║
-     ║  Production   → https://abcdef1234.serveo.net ║
-     ╚═══════════════════════════════════════════╝
-
-     ✅ Development will be accessible at: https://abcdef1234.serveo.net (via Serveo)
-     ```
-
-4. **Test Locally**:
-
-   * `curl -I http://127.0.0.1:<port>/` → should return `200`.
-   * `curl -k -I https://localhost:9443/` → should return `200` (ignore cert warning or add `-k`).
-   * `curl -k -I https://<LAN_IP>:9443/` → should return `200`.
-   * `curl -I https://abcdef1234.serveo.net/` → should return `200`.  (No 502s, because Serveo expects the ephemeral host.)
-
-5. **When you’re done**, press **Ctrl+C** in the terminal. That will kill the SSH tunnel, Node process, and the local HTTPS proxy.
-
----
-
-## Running in PRODUCTION Mode (Cloudflare + Custom Subdomain)
-
-Use **PRODUCTION mode** when you want to bind your own subdomain—for example:
-
-```
-chat.hypermindlabs.org → tunnels to your local Node via Serveo
+```bash
+curl -fsSL https://raw.githubusercontent.com/robit-man/serveo-local-dev/main/server.py \
+  -o ~/serveo-launcher.py && chmod +x ~/serveo-launcher.py && python3 ~/serveo-launcher.py
 ```
 
-All DNS changes are done automatically via the Cloudflare API.  You only have to supply:
+* **What this does:**
 
-1. A Cloudflare API Token with “Edit zone DNS” permissions.
-2. Your Cloudflare **Zone Name** (e.g. `hypermindlabs.org`)
-3. A subdomain (e.g. `chat`)
-4. TTL (default 300 seconds).
+  1. `curl -fsSL <URL> -o ~/serveo-launcher.py` → downloads `server.py` into your home folder as `serveo-launcher.py`.
+  2. `chmod +x ~/serveo-launcher.py` → makes it executable.
+  3. `python3 ~/serveo-launcher.py` → runs the script with Python 3.
 
-The script will then:
-
-* Create two DNS records via Cloudflare’s API:
-
-  1. **CNAME** `chat.hypermindlabs.org → serveo.net` (proxied = OFF)
-  2. **TXT** `_serveo-authkey.chat.hypermindlabs.org → "SHA256:<your-ssh-fingerprint>"` (proxied = OFF)
-* Wait \~60 seconds for propagation.
-* Run:
-
-  ```
-  ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
-      -R chat.hypermindlabs.org:80:localhost:<port> serveo.net
-  ```
-
-  That binds `chat.hypermindlabs.org` to your local Node.
-* Generate a multi-SAN certificate covering:
-
-  * `localhost`
-  * your LAN IP (e.g. `192.168.1.42`)
-  * `chat.hypermindlabs.org`
-  * the ephemeral Serveo hostname (if any)
-  * `127.0.0.1`
-* Start a local HTTPS reverse-proxy on port **9443** (forwarding to Node).
-* Print a banner with all endpoints.
-
-### 5.1 Creating a Cloudflare API Token
-
-1. **Log in** to your Cloudflare dashboard:
-   [https://dash.cloudflare.com](https://dash.cloudflare.com)
-
-2. In the top menu, click **“Profile”** (your user icon) → **API Tokens**.
-
-   * Alternatively, go directly to:
-     [https://dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
-
-3. Click **“Create Token”**.
-
-4. **Choose a Template**:
-
-   * Select **“Edit zone DNS”** (this will grant just enough permissions to list zones and create/update DNS records).
-   * You can also create a custom token with exactly these permissions:
-
-     * **Zone → DNS → Edit**
-     * **Account → Read → Zones**
-
-5. In **“Zone Resources”**, set “Include” to “Specific zone” and choose your domain (e.g. `hypermindlabs.org`).
-
-   * This ensures the token only works for that one zone.
-
-6. Click **“Continue to summary”**, review, and **“Create Token”**.
-
-7. Copy the newly minted token.  **Store it safely**, because you’ll need it when the script prompts:
-
-   ```
-   Cloudflare API Token: <paste-token-here>
-   ```
+After that, follow the on-screen prompts.
 
 ---
 
-### 5.2 Invoking the Script in Production Mode
+## 📑 Detailed Steps & Explanations
 
-1. **Run** the orchestration script:
+### 1. First Run: Virtualenv + Dependencies
+
+When you run `serveo-launcher.py` for the first time, it will:
+
+1. Look for `venv/` in the same directory. If not present:
 
    ```bash
-   ./server.py
+   python3 -m venv venv
+   ```
+2. Activate that venv and run:
+
+   ```bash
+   pip install cryptography requests
+   ```
+3. Re-exec itself inside `venv/`, so all imports work out of the box.
+
+**Outcome:** a local Python venv with all necessary modules, and then you’ll see a prompt asking “DEV or PRODUCTION?”
+
+---
+
+### 2. Choose Mode
+
+After the venv is ready, you’ll see:
+
+```
+⚠ Do you want to run in DEV mode or PRODUCTION mode?
+   1) DEV (no Cloudflare, just random Serveo subdomain)
+   2) PRODUCTION (Cloudflare + custom subdomain)
+Enter 1 or 2:
+```
+
+* Type `1` and press Enter → **DEV mode**
+* Type `2` and press Enter → **PRODUCTION mode**
+
+---
+
+### 3. DEV Mode (Option 1)
+
+If you choose **DEV**, the script will:
+
+1. Pick a free port for your Node app (starts at 3000, increments if busy).
+2. Run `npm install` (if `package.json` exists).
+3. Start your Node process with `PORT=<chosen_port> npm run start`.
+4. Generate (or reuse) `~/.ssh/id_rsa` & `~/.ssh/id_rsa.pub`, compute the SSH key’s SHA256 fingerprint.
+5. Launch a random Serveo tunnel with:
+
+   ```bash
+   ssh  -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R 80:localhost:<app_port> serveo.net
    ```
 
-2. When prompted:
+   Serveo picks a random subdomain (e.g. `abcdef1234.serveo.net`) and reports:
 
    ```
-   ⚠  Do you want to run in DEV mode or PRODUCTION mode?
-      1) DEV (no Cloudflare, just random Serveo subdomain)
-      2) PRODUCTION (Cloudflare + custom subdomain)
-   Enter 1 or 2: 2
+   Forwarding HTTP traffic from https://abcdef1234.serveo.net to localhost:<app_port>
+   ```
+6. Generate a multi-SAN certificate covering:
+
+   * `localhost`
+   * your LAN IP (e.g. `192.168.1.42`)
+   * the random `abcdef1234.serveo.net`
+   * `127.0.0.1`
+   * (If you have `mkcert` installed, it uses mkcert; otherwise it falls back to a self-signed.)
+7. Start a local HTTPS reverse proxy on port **9443** that forwards to `http://127.0.0.1:<app_port>`.
+
+You’ll see a banner like:
+
+```
+╔═══════════════════════════════════════════════════╗
+║  Node (HTTP)  → http://127.0.0.1:3015             ║
+║  Local Dev    → https://localhost:9443            ║
+║  LAN Dev      → https://192.168.1.42:9443         ║
+║  Production   → https://abcdef1234.serveo.net     ║
+╚═══════════════════════════════════════════════════╝
+
+✅ Development will be accessible at: https://abcdef1234.serveo.net (via Serveo)
+⚠ All services started. Press Ctrl+C to terminate.
+```
+
+**DEV Mode Quick Tests:**
+
+```bash
+curl -I http://127.0.0.1:<app_port>/       # → 200
+curl -k -I https://localhost:9443/         # → 200 (ignore cert warning)
+curl -k -I https://<LAN_IP>:9443/          # → 200
+curl -I https://abcdef1234.serveo.net/     # → 200
+```
+
+---
+
+### 4. PRODUCTION Mode (Option 2)
+
+If you choose **PRODUCTION**, the script will prompt for:
+
+```
+⚠ Before proceeding, make sure you have a Cloudflare API Token with “Edit zone DNS” permissions for your zone.
+
+Cloudflare API Token     : <YOUR_CLOUDFLARE_TOKEN>
+Cloudflare Zone Name     : <your-domain.com>
+Subdomain (e.g. chat)    : <subdomain>
+DNS TTL (secs) [300]: <TTL or press Enter for 300>
+```
+
+* **Cloudflare API Token**:
+
+  * Must have “Zone → DNS → Edit” for your domain (or more granular permissions limited to your zone).
+  * ⚠ Copy it now. The script will store it in `domain.conf` but you should still keep a secure backup.
+
+* **Cloudflare Zone Name**:
+
+  * Your root domain exactly as it appears in Cloudflare (e.g. `hypermindlabs.org`).
+  * Do not include “http\://” or “[www.”](http://www.”).
+
+* **Subdomain**:
+
+  * The label you want to claim (e.g. `chat`). The full custom domain will become `chat.hypermindlabs.org`.
+
+* **TTL**:
+
+  * DNS TTL for the new records (default 300 seconds).
+
+Once you fill those in, the script:
+
+1. Verifies your Cloudflare token/zone by calling:
+
+   ```
+   GET https://api.cloudflare.com/client/v4/zones?name=<your-domain.com>&status=active
    ```
 
-3. Then provide:
+2. Fetches the **zone\_id** from the JSON response.
 
-   * **Cloudflare API Token**: (the token you just created)
-   * **Cloudflare Zone Name**: e.g. `hypermindlabs.org`
-   * **Subdomain**: e.g. `chat`  (that becomes `chat.hypermindlabs.org`)
-   * **DNS TTL**: default `300` (press Enter to accept)
+3. Generates (or reuses) `~/.ssh/id_rsa` & `id_rsa.pub` and computes SHA256 fingerprint.
 
-   Example:
+4. **Creates/updates two DNS records** via Cloudflare API:
 
+   * **CNAME**
+
+     ```
+     Name:  <subdomain>.<zone_name>
+     Type:  CNAME
+     Content:  serveo.net
+     TTL:  <TTL>
+     Proxy status:  DNS only (OFF)
+     ```
+
+     → e.g. `chat.hypermindlabs.org  CNAME  serveo.net  (TTL=300)`
+
+   * **TXT**
+
+     ```
+     Name:  _serveo-authkey.<subdomain>.<zone_name>
+     Type:  TXT
+     Content:  "SHA256:<fingerprint>"
+     TTL:  <TTL>
+     ```
+
+     → e.g. `_serveo-authkey.chat.hypermindlabs.org  TXT  "SHA256:QpVnrJX..."  (TTL=300)`
+
+   Sample Cloudflare API calls under-the-hood:
+
+   ```http
+   POST https://api.cloudflare.com/client/v4/zones/<zone_id>/dns_records
+   { 
+     "type":"CNAME", 
+     "name":"chat.hypermindlabs.org", 
+     "content":"serveo.net",
+     "ttl":300,
+     "proxied":false
+   }
+
+   POST https://api.cloudflare.com/client/v4/zones/<zone_id>/dns_records
+   { 
+     "type":"TXT", 
+     "name":"_serveo-authkey.chat.hypermindlabs.org",
+     "content":"SHA256:QpVnrJX...",
+     "ttl":300
+   }
    ```
-   Cloudflare API Token     : R9V9XWF-aIsWacXw0YYh2IsntIG-V_x1w5UqL_Ad
-   Cloudflare Zone Name     : hypermindlabs.org
-   Subdomain (e.g. chat)    : chat
-   DNS TTL (secs) [300]: 300
-   ```
 
-4. The script will validate your zone name by calling:
-
-   ```
-   GET https://api.cloudflare.com/client/v4/zones?name=hypermindlabs.org&status=active
-   ```
-
-   If it returns a valid zone, you’ll see:
-
-   ```
-   ✅ Found zone_id: abcdef1234567890abcdef1234567890
-   ```
-
-5. The script calls the Cloudflare API to create/update:
-
-   * **CNAME** `chat.hypermindlabs.org → serveo.net`
-   * **TXT** `_serveo-authkey.chat.hypermindlabs.org → "SHA256:<fingerprint>"`
-
-   You’ll see output like:
-
-   ```
-   [Cloudflare] Created CNAME record chat.hypermindlabs.org → serveo.net  (TTL=300)
-   [Cloudflare] Created TXT record _serveo-authkey.chat.hypermindlabs.org → SHA256:QpVnrJXD96qfx8KxduKxt2i9mB3JnVbK8GVoFlk7Ybo  (TTL=300)
-   ```
-
-6. **Wait \~60 seconds** for DNS to propagate.  The script shows:
+5. **Waits \~60 seconds** (Cloudflare TTL) for DNS propagation.
+   You’ll see:
 
    ```
    ⏳ Waiting 60 seconds for DNS to propagate … (Cloudflare TTL is 300 s)
    ```
 
-7. Next, the script runs:
+6. **Launches** Serveo tunnel with custom‐domain binding:
+
+   ```bash
+   ssh  -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
+       -R <subdomain>.<zone_name>:80:localhost:<app_port> serveo.net
+   ```
+
+   e.g.
+
+   ```bash
+   ssh  -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
+       -R chat.hypermindlabs.org:80:localhost:3015 serveo.net
+   ```
+
+   Once Serveo verifies the TXT record (`_serveo-authkey.chat.hypermindlabs.org`) and your SSH key fingerprint, it will reply:
 
    ```
-   ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
-       -R chat.hypermindlabs.org:80:localhost:<port> serveo.net
+   Forwarding HTTP traffic from https://chat.hypermindlabs.org to localhost:3015
    ```
 
-   You should see Serveo’s confirmation:
+   and the script prints:
 
    ```
    ✅ Serveo tunnel established: https://chat.hypermindlabs.org
    ```
 
-8. Finally, it generates a certificate (self‐signed or via `mkcert`) valid for:
+7. Generates a multi-SAN certificate covering:
 
-   ```
-   “localhost”, “<LAN_IP>”, “chat.hypermindlabs.org”, “<ephemeral.serveo.net>”, “127.0.0.1”
-   ```
+   * `localhost`
+   * your LAN IP (e.g. `192.168.1.42`)
+   * `chat.hypermindlabs.org`
+   * the ephemeral Serveo host (if any)
+   * `127.0.0.1`
+     (Uses **mkcert** if installed, else self-signed.)
 
-   and starts the local HTTPS proxy on port **9443**.
+8. Starts a local HTTPS reverse proxy on port **9443** → `http://127.0.0.1:<app_port>`.
 
-9. **Banner Example**:
+9. Prints a banner:
 
    ```
    ╔═══════════════════════════════════════════════════╗
@@ -373,209 +304,179 @@ The script will then:
    ╚═══════════════════════════════════════════════════╝
 
    ✅ Production will be accessible at: https://chat.hypermindlabs.org (via Serveo → chat.hypermindlabs.org)
-
    ⚠ All services started. Press Ctrl+C to terminate.
    ```
 
 ---
 
-### 5.3 DNS Records Automatically Set by the Script
+## 🔍 Verify DNS & Tunnel
 
-Once the script finishes (in PRODUCTION mode), you can log in to your Cloudflare dashboard → DNS for `hypermindlabs.org` and verify that you have exactly these records (CNAME & TXT), **both set to “DNS only”** (grey cloud):
-
-| Type  | Name                                     | Content                | TTL | Proxy |
-| ----- | ---------------------------------------- | ---------------------- | --- | ----- |
-| CNAME | `chat.hypermindlabs.org`                 | `serveo.net`           | 300 | Off   |
-| TXT   | `_serveo-authkey.chat.hypermindlabs.org` | `SHA256:<fingerprint>` | 300 | Off   |
-
-* **Why “DNS only”?**
-
-  * If you set the CNAME to **“Proxied (orange cloud)”** (Cloudflare’s CDN/WAF), Cloudflare will forward HTTP requests with `Host: chat.hypermindlabs.org` to some Cloudflare IP. Cloudflare then tries to talk to the origin (which is behind the CNAME → `serveo.net`), but it sends the wrong `Host:` header to Serveo (still `chat.hypermindlabs.org`). Serveo expects to only see `Host: chat.hypermindlabs.org` if it is running `ssh -R chat.hypermindlabs.org:80:…`. Actually, that should work if the script runs the correct SSH command. But mixing Cloudflare’s proxy can complicate SNI/SSL. We strongly recommend **leaving the CNAME as DNS only**. That way, the client (browser) resolves `chat.hypermindlabs.org → serveo.net` directly, TLS handshake happens with Serveo’s Let’s Encrypt or self‐signed cert (ours), and traffic flows straight to your local machine.
-
----
-
-### 5.4 Verifying Propagation & Testing
-
-1. **Check DNS Propagation** (after the script’s 60-second wait):
+1. **Check CNAME** (after \~60 s):
 
    ```bash
    dig @1.1.1.1 CNAME chat.hypermindlabs.org +short
+   # → serveo.net.
    ```
-
-   You should see:
-
-   ```
-   serveo.net.
-   ```
-
-   (not a random `xyz.serveo.net`; just `serveo.net`)
 
 2. **Check TXT**:
 
    ```bash
    dig @1.1.1.1 TXT _serveo-authkey.chat.hypermindlabs.org +short
+   # → "SHA256:<fingerprint>"
    ```
 
-   You should see:
+3. **Ensure Cloudflare’s CNAME record is “DNS only”** (grey cloud).
+   If it’s **Proxied (orange cloud)**, you’ll see 502 errors because Cloudflare would be fronting the SSL handshake. Custom-domain Serveo only works when Cloudflare is set to **DNS only** for that CNAME.
 
-   ```
-   "SHA256:<your-fingerprint>"
-   ```
-
-3. **Make sure Cloudflare’s CNAME is DNS only** (grey cloud) in the UI.  Then test:
+4. **Test Production endpoint**:
 
    ```bash
-   curl -I https://chat.hypermindlabs.org/
+   curl -I https://chat.hypermindlabs.org/ 
+   # → HTTP/2 200 OK (if your Node app’s `/` responds)
    ```
 
-   * You should get `HTTP/2 200` (assuming your Node app responds on `/`).
-   * If you see `HTTP/2 502`, re-check that your CNAME is DNS only and that the TXT is correct. Also ensure you ran `ssh -R chat.hypermindlabs.org:80:localhost:<port> serveo.net` (which the script handles for you).
-
-4. **Local HTTPS Tests** (the script also spawned this on port 9443):
+5. **Local HTTPS** (for dev/test):
 
    ```bash
-   curl -k -I https://localhost:9443/      # should return 200
-   curl -k -I https://<LAN_IP>:9443/       # should return 200
-   ```
-
-5. **Check Node directly**:
-
-   ```bash
-   curl -I http://127.0.0.1:<port>/       # should return 200
+   curl -k -I https://localhost:9443/       # → 200
+   curl -k -I https://<LAN_IP>:9443/        # → 200
+   curl -I http://127.0.0.1:<app_port>/      # → 200
    ```
 
 ---
 
-## How It Works: Key Points
+## ⚙️ How It All Works / Key Points
 
-### 6.1 SSH Key & Fingerprint
+1. **SSH Key & Fingerprint**
 
-* If you don’t already have `~/.ssh/id_rsa.pub`, the script runs:
+   * If `~/.ssh/id_rsa.pub` doesn’t exist, the script runs:
 
-  ```bash
-  ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N ""
-  ```
+     ```bash
+     ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N ""
+     ```
+   * It then runs:
 
-  then uses `ssh-keygen -lf ~/.ssh/id_rsa.pub -E sha256` to compute the fingerprint, which looks like:
+     ```bash
+     ssh-keygen -lf ~/.ssh/id_rsa.pub -E sha256
+     ```
 
-  ```
-  2048 SHA256:QpVnrJXD96qfx8KxduKxt2i9mB3JnVbK8GVoFlk7Ybo user@host (RSA)
-  ```
+     to extract a fingerprint like `SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz…`.
 
-  We extract the part after `SHA256:` (no prefix).
+2. **TXT Record Naming**
 
-### 6.2 TXT Record Naming
+   * Serveo’s **Custom Domain** requirement:
 
-* **Serveo’s requirement:** For a custom domain (e.g. `chat.example.com`), you must have a TXT record at:
+     ```
+     _serveo-authkey.<subdomain>.<zone> = SHA256:<fingerprint>
+     ```
 
-  ```
-  _serveo-authkey.chat.example.com = SHA256:<fingerprint>
-  ```
-* Once Serveo sees that TXT, it knows that the owner of that SSH key is authorized to bind `chat.example.com`.
+     Example:
 
-### 6.3 CNAME Target for Custom Domain
+     ```
+     _serveo-authkey.chat.hypermindlabs.org = "SHA256:QpVnrJXD96qx…"
+     ```
 
-* To claim a custom domain, Serveo needs **exactly**:
+3. **CNAME Target for Custom Domain**
 
-  ```
-  chat.example.com  → CNAME → serveo.net
-  ```
+   * For a custom domain `chat.hypermindlabs.org`, the CNAME must point to `serveo.net` (not `abcdef1234.serveo.net`).
+   * Example:
 
-  (proxied = OFF in Cloudflare).
+     ```
+     chat.hypermindlabs.org  CNAME  serveo.net  (TTL=300, proxied=OFF)
+     ```
 
-* **Why not** point to the ephemeral `xyz.serveo.net`? Because Serveo will only route traffic for a domain if the CNAME is to `serveo.net`.  If you point to `xyz.serveo.net`, Serveo treats it as a “plain ephemeral” request, not a “custom domain” request. So the tunnel for `xyz.serveo.net` may work, but not for `chat.example.com`.
+4. **Custom-Domain SSH Command**
 
-### 6.4 Custom-Domain SSH Command
+   * DEV (ephemeral subdomain):
 
-* **DEV (random subdomain)**:
+     ```bash
+     ssh -R 80:localhost:<port> serveo.net
+     ```
 
-  ```bash
-  ssh -R 80:localhost:<port> serveo.net
-  ```
+     → Serveo assigns you a random `abcdef1234.serveo.net`.
+   * PROD (custom domain):
 
-  → Forwards a randomly generated `abcdef1234.serveo.net`.
+     ```bash
+     ssh -R chat.hypermindlabs.org:80:localhost:<port> serveo.net
+     ```
 
-* **PROD (custom domain)**:
+     Serveo looks up `_serveo-authkey.chat.hypermindlabs.org`, verifies your fingerprint, then binds `chat.hypermindlabs.org` to your local port.
 
-  ```bash
-  ssh -R chat.example.com:80:localhost:<port> serveo.net
-  ```
+5. **SSL Certificates & Local HTTPS**
 
-  → Serveo reads DNS `_serveo-authkey.chat.example.com`, verifies your key, then binds `chat.example.com` to your localhost port.
+   * The script generates a multi-SAN cert for:
 
-### 6.5 SSL Certificates + Local HTTPS
+     ```
+     localhost, <LAN_IP>, <real_domain (if prod) />, <serveo_host (random or custom)>, 127.0.0.1
+     ```
+   * If you’ve installed [mkcert](https://github.com/FiloSottile/mkcert) and run `mkcert -install`, the script uses mkcert for a locally-trusted cert. Otherwise it falls back to self-signed (you’ll have to bypass the warning).
 
-* The script creates a multi-SAN certificate that covers all relevant names:
+6. **Cloudflare Proxy Status**
 
-  ```
-  - "localhost"
-  - "<LAN_IP>"             # e.g. "192.168.1.42"
-  - "<real_domain>"        # e.g. "chat.hypermindlabs.org" (only in PROD)
-  - "<tunnel_domain>"      # e.g. "abcdef1234.serveo.net"
-  - "127.0.0.1"
-  ```
-
-* If **mkcert** is installed, it uses mkcert to generate a locally-trusted cert. Otherwise it falls back to a self-signed certificate (which your browser will warn about, but you can bypass).
-
-* It launches an HTTPS server on port **9443** that proxies all traffic to your Node app on `localhost:<port>`.
-
----
-
-## Troubleshooting
-
-### 7.1 502 Errors from Cloudflare
-
-* **Symptoms**:
-
-  * You see `HTTP/2 502` when curling `https://chat.example.com/`, even though `curl http://abcdef1234.serveo.net/` → `200`.
-
-* **Cause**:
-
-  * Cloudflare is in “Proxied” mode (orange cloud). It attempts to proxy `chat.example.com` to an origin of `chat.example.com` (Host header), but the CNAME points to `serveo.net`. Cloudflare is forwarding traffic with `Host: chat.example.com` to Serveo’s origin. Serveo only binds `chat.example.com` if you did the **custom-domain** SSH (`-R chat.example.com:80:…`). If you didn’t do that exact SSH or if you left CNAME proxied, Serveo will not route correctly → 502.
-
-* **Fix**:
-
-  1. In Cloudflare’s DNS panel, ensure the **CNAME** record for `chat.example.com` is set to **“DNS only”** (grey cloud).
-  2. If you truly need Cloudflare’s proxy, you must use a **Cloudflare Worker** or the paid “Origin Host Header” feature to rewrite the Host header that goes to Serveo → beyond this README’s scope. The simplest route is to leave it DNS only.
-
-### 7.2 “Unable to find active zone” Errors
-
-* **Symptoms**:
-
-  ```
-  ❌ Unable to find active zone 'hypermindlabs.org' in Cloudflare. Response: ...
-  ```
-
-* **Cause**:
-
-  * Either your Cloudflare API token doesn’t have permission or you typed the zone name incorrectly.
-  * Make sure:
-
-    * Your token has “Zone → DNS → Edit” on that specific zone.
-    * The zone name is exactly your root domain (e.g. `hypermindlabs.org`), not including “[www.”](http://www.”)
-
-* **Fix**:
-
-  1. Log in to Cloudflare → Dashboard → DNS → look at the Zone name.
-  2. Go to **Profile → API Tokens → edit** that token → verify “Zone Resources → Include → Specific zone → hypermindlabs.org” is correct.
-  3. Use that exact zone name in the prompt.
-
-### 7.3 SSL Certificate Issues
-
-* **Self-signed**: Your browser will warn. You can safely click through (on `https://localhost:9443` or `https://chat.example.com` if you accept the self-signed).
-* **mkcert**: If you run `brew install mkcert` (macOS) or follow [mkcert instructions](https://github.com/FiloSottile/mkcert), then `./server.py` calls `mkcert -install` and automatically trusts your local CA. You’ll get no warnings for `localhost`, LAN IP, or `chat.example.com` (because mkcert obtains a valid certificate from your local trusted CA).
+   * **Always leave the “CNAME → serveo.net” record as DNS only** (grey cloud).
+   * If you switch it ON (orange cloud), Cloudflare proxies your request, sends `Host: chat.hypermindlabs.org` to Serveo’s IP. Serveo sees `Host: chat.hypermindlabs.org` *but* the CNAME points to `serveo.net`. This confuses Serveo’s routing, resulting in a 502.
+   * For a simple Serveo tunnel, you don’t need Cloudflare’s CDN/proxy layer—just DNS.
 
 ---
 
-## Appendix: Useful Links
+## 🛠 Troubleshooting
+
+### 1. “502” from `https://chat.hypermindlabs.org/`
+
+* **Likely cause:** Cloudflare CNAME was set to “Proxied (orange cloud).”
+* **Fix:** In your Cloudflare dashboard → DNS → locate the CNAME for `chat…` → toggle it to **“DNS only”** (grey cloud). Wait a few seconds, then retry `curl -I https://chat.hypermindlabs.org/` → 200.
+
+### 2. “Unable to find active zone” Errors
+
+* **Symptoms:**
+
+  ```
+  ❌ Unable to find active zone 'hypermindlabs.org' in Cloudflare. Response: { “result”:[], “success”:true, … }
+  ```
+* **Cause:**
+
+  * You typed the zone name incorrectly (e.g. `www.hypermindlabs.org` instead of `hypermindlabs.org`).
+  * Your API token doesn’t have the correct permissions or isn’t scoped to that zone.
+* **Fix:**
+
+  1. In Cloudflare → Dashboard → DNS, verify your zone name exactly (e.g. `hypermindlabs.org`).
+  2. In Cloudflare → Profile → API Tokens, ensure your token has “Zone → DNS → Edit” for **that specific** zone.
+  3. Run the script again and enter the correct zone name + token.
+
+### 3. SSH Key / Fingerprint Errors
+
+* If `ssh-keygen` fails, ensure OpenSSH is installed.
+* Check that `~/.ssh/id_rsa.pub` exists. The script will auto-generate a 2048-bit RSA key if not found.
+
+### 4. SSL / mkcert Warnings
+
+* **mkcert installed?**
+
+  * If you have `mkcert`: the script runs `mkcert -install` and issues a cert trusted by your OS/browser. No warnings.
+  * If you do **not** have `mkcert`: the script creates a self-signed cert. Browsers will show “Not secure” for `https://localhost:9443` (you can bypass). That’s expected.
+
+---
+
+## 🔗 Appendix: Useful Links
+
+* **GitHub script source** (always gets the very latest `server.py`):
+  [https://github.com/robit-man/serveo-local-dev/blob/main/server.py](https://github.com/robit-man/serveo-local-dev/blob/main/server.py)
+
+* **Raw download link** (the single-line installer uses this):
+
+  ```
+  https://raw.githubusercontent.com/robit-man/serveo-local-dev/main/server.py
+  ```
 
 * **Cloudflare API Tokens**
-  Create an API token with “Edit zone DNS” permissions:
+  Create a token with “Edit zone DNS” permission:
   [https://dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
 
-* **Cloudflare Developer Docs**
+* **Cloudflare DNS API Docs**
 
-  * List / Create / Update DNS records:
+  * List zones:
+    [https://developers.cloudflare.com/api/operations/zones-list](https://developers.cloudflare.com/api/operations/zones-list)
+  * DNS Records:
     [https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-list-dns-records](https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-list-dns-records)
     [https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-create-dns-record](https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-create-dns-record)
     [https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-update-dns-record](https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-update-dns-record)
@@ -584,28 +485,34 @@ Once the script finishes (in PRODUCTION mode), you can log in to your Cloudflare
   (Scroll to “Custom Domain” section)
   [https://serveo.net/](https://serveo.net/)
 
-* **mkcert** (optional, for local-trusted certificates)
+* **mkcert** (for local trusted certs)
   [https://github.com/FiloSottile/mkcert](https://github.com/FiloSottile/mkcert)
-
-* **ssh-keygen fingerprint**
-  To manually compute a key’s fingerprint:
-
-  ```bash
-  ssh-keygen -lf ~/.ssh/id_rsa.pub -E sha256
-  ```
 
 ---
 
-### Summary
+### Quick Recap
 
-* **DEV mode** is for quick local tests: random `*.serveo.net` + local HTTPS.
-* **PROD mode** uses Cloudflare + a custom subdomain.  The script automatically:
+```bash
+curl -fsSL https://raw.githubusercontent.com/robit-man/serveo-local-dev/main/server.py \
+  -o ~/serveo-launcher.py && chmod +x ~/serveo-launcher.py && python3 ~/serveo-launcher.py
+```
 
-  1. Creates a CNAME to `serveo.net` (DNS only).
-  2. Creates a TXT `_serveo-authkey… = SHA256:<fingerprint>`.
-  3. Waits, then runs `ssh -R chat.example.com:80:localhost:<port> serveo.net` so Serveo binds your domain.
-  4. Generates a certificate and starts a local HTTPS reverse-proxy on 9443.
+1. Choose **DEV** if you want a quick random `*.serveo.net` tunnel + local HTTPS.
+2. Choose **PRODUCTION** if you want a **Cloudflare + custom subdomain** (`chat.yourdomain.com`).
 
-After that, visiting **`https://chat.example.com`** in your browser should connect directly through Serveo to your local Node, without any 502 errors.
+   * Provide your **Cloudflare API Token**, **Zone Name**, **Subdomain**, and **TTL** when prompted.
+   * The script automatically creates:
 
-Enjoy seamless Dev + Production tunnels!
+     * `chat.yourdomain.com → CNAME → serveo.net` (DNS only)
+     * `_serveo-authkey.chat.yourdomain.com → TXT → "SHA256:<fingerprint>"`
+   * Wait \~60 s, then the script runs:
+
+     ```bash
+     ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
+         -R chat.yourdomain.com:80:localhost:<port> serveo.net
+     ```
+   * Serveo verifies the TXT @ `_serveo-authkey.chat…` and binds your domain.
+
+After that, go to `https://chat.yourdomain.com/` in your browser (or `curl -I`) and you should see your Node app’s response (HTTP 200) without any 502.
+
+Press **Ctrl+C** to shut everything down (Node, SSH tunnel, local HTTPS proxy).
