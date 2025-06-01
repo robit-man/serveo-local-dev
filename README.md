@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/robit-man/serveo-local-dev/main/ser
 
 * This:
 
-  1. Downloads `server.py` into the **current directory** (not `$HOME`).
+  1. Downloads `server.py` into the **current directory**.
   2. Makes it executable.
   3. Executes it under Python 3 (it will auto-create a `venv/` and install dependencies).
 
