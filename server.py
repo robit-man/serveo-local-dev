@@ -41,6 +41,7 @@ DEV_HTTPS_PORT = 9443
 # Default TTL for Cloudflare DNS records (seconds)
 DEFAULT_TTL    = 300
 
+
 # ─── SPINNER (for long installs) ───────────────────────────────────────────────
 class Spinner:
     def __init__(self, msg):
@@ -63,6 +64,7 @@ class Spinner:
         self._stop.set()
         self._thr.join()
 
+
 # ─── 1) VIRTUALENV BOOTSTRAP ────────────────────────────────────────────────────
 def bootstrap_and_run():
     """
@@ -82,6 +84,7 @@ def bootstrap_and_run():
         sys.argv.remove(VENV_FLAG)
         main()
 
+
 # ─── 2) CONFIG I/O ─────────────────────────────────────────────────────────────
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -95,31 +98,33 @@ def save_config(cfg):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
 
+
 # ─── 3) DOMAIN.CONF I/O ────────────────────────────────────────────────────────
 def create_domain_conf():
     """
-    Prompt user for:
-      • Dev or Prod?
-      • (If Prod) Cloudflare API token + zone name + subdomain + TTL
-    Save answers to domain.conf.
+    Prompt user to choose DEV vs PRODUCTION. 
+    If PRODUCTION, ask for Cloudflare API token + zone name + subdomain + TTL. 
+    Save these in domain.conf.
     """
-    print("\n⚠  Do you want to run in DEV mode (only local HTTPS + Serveo) or PROD mode (Cloudflare + Serveo)?")
-    while True:
-        mode = input("  Type 'dev' or 'prod': ").strip().lower()
-        if mode in ("dev", "prod"):
-            break
-        else:
-            print("  Please enter exactly 'dev' or 'prod'.")
-    if mode == "dev":
+    print("\n⚠  Do you want to run in DEV mode or PRODUCTION mode?")
+    print("   1) DEV (no Cloudflare, just random Serveo subdomain)")
+    print("   2) PRODUCTION (Cloudflare + custom subdomain)")
+    choice = input("Enter 1 or 2: ").strip()
+    if choice not in ("1", "2"):
+        print("Invalid choice—please run again and choose 1 or 2.")
+        sys.exit(1)
+
+    if choice == "1":
+        # DEV mode: no DNS changes needed
         conf = {
             "mode": "dev"
         }
         with open(DOMAIN_CONF, "w") as f:
             json.dump(conf, f, indent=4)
-        print("\n✅ domain.conf created in DEV mode.\n")
+        print("\n✅ Running in DEV mode. No DNS changes will be made.\n")
         return conf
 
-    # ── PROD MODE ──
+    # PRODUCTION path:
     print("\n⚠  Before proceeding, make sure you have a Cloudflare API Token with “Edit zone DNS” permissions for your zone.\n")
     cf_token   = input("  Cloudflare API Token     : ").strip()
     zone_name  = input("  Cloudflare Zone Name     : ").strip()
@@ -130,7 +135,7 @@ def create_domain_conf():
     except:
         ttl = DEFAULT_TTL
 
-    # Fetch zone_id from Cloudflare
+    # Fetch the zone ID from Cloudflare
     headers = {
         "Authorization": f"Bearer {cf_token}",
         "Content-Type": "application/json"
@@ -143,27 +148,28 @@ def create_domain_conf():
     )
     data = resp.json()
     if not data.get("success") or len(data.get("result", [])) == 0:
-        print(f"\n❌ Unable to find active zone '{zone_name}' in Cloudflare. Response:\n  {json.dumps(data, indent=2)}")
+        print(f"❌ Unable to find active zone '{zone_name}' in Cloudflare. Response: {data}")
         sys.exit(1)
     zone_id = data["result"][0]["id"]
 
     conf = {
-        "mode":      "prod",
-        "cf_token":  cf_token,
-        "zone_id":   zone_id,
-        "zone_name": zone_name,
-        "host":      host,
-        "ttl":       ttl
+        "mode":       "prod",
+        "cf_token":   cf_token,
+        "zone_id":    zone_id,
+        "zone_name":  zone_name,
+        "host":       host,
+        "ttl":        ttl
     }
     with open(DOMAIN_CONF, "w") as f:
         json.dump(conf, f, indent=4)
-    print("\n✅ domain.conf created in PROD mode.\n")
+    print("\n✅ domain.conf created. Will use these credentials to update DNS soon.\n")
     return conf
 
 def load_domain_conf():
     if not os.path.exists(DOMAIN_CONF):
         return create_domain_conf()
     return json.load(open(DOMAIN_CONF))
+
 
 # ─── 4) HELPERS ─────────────────────────────────────────────────────────────────
 def get_lan_ip():
@@ -182,9 +188,7 @@ def get_public_ip():
         return None
 
 def port_in_use(port: int) -> bool:
-    """
-    Return True if anything is already bound on 0.0.0.0:<port>.
-    """
+    """Return True if anything is already bound on 0.0.0.0:<port>."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind(("0.0.0.0", port))
@@ -192,37 +196,37 @@ def port_in_use(port: int) -> bool:
         except OSError:
             return True
 
+
 # ─── 5) BANNER ─────────────────────────────────────────────────────────────────
-def print_banner(lan_ip: str, public_domain: str, app_port: int, mode: str):
+def print_banner(lan_ip: str, public_domain: str, app_port: int):
     """
     Show where your service is listening:
       • Node (HTTP)  → http://127.0.0.1:<app_port>
       • Local Dev    → https://localhost:9443
       • LAN Dev      → https://<lan_ip>:9443
-      • (If prod) Production  → https://<public_domain>
+      • Production   → https://<public_domain>
     """
     lines = [
         f"  Node (HTTP)  → http://127.0.0.1:{app_port}",
         f"  Local Dev    → https://localhost:{DEV_HTTPS_PORT}",
-        f"  LAN Dev      → https://{lan_ip}:{DEV_HTTPS_PORT}"
+        f"  LAN Dev      → https://{lan_ip}:{DEV_HTTPS_PORT}",
+        f"  Production   → https://{public_domain}"
     ]
-    if mode == "prod":
-        lines.append(f"  Production   → https://{public_domain}")
-
     w = max(len(l) for l in lines) + 4
     print("\n╔" + "═"*w + "╗")
     for l in lines:
         print("║" + l.ljust(w) + "║")
     print("╚" + "═"*w + "╝\n")
 
+
 # ─── 6) SSH KEY + FINGERPRINT ───────────────────────────────────────────────────
 def ensure_ssh_key():
     """
     If ~/.ssh/id_rsa.pub is missing, generate a new 2048-bit RSA key.
-    Return the SHA256 fingerprint (no “SHA256:” prefix).
+    Return the SHA256 fingerprint (without the “SHA256:” prefix).
     """
-    ssh_dir = os.path.expanduser("~/.ssh")
-    pubkey_path = os.path.join(ssh_dir, "id_rsa.pub")
+    ssh_dir      = os.path.expanduser("~/.ssh")
+    pubkey_path  = os.path.join(ssh_dir, "id_rsa.pub")
     privkey_path = os.path.join(ssh_dir, "id_rsa")
 
     if not os.path.isdir(ssh_dir):
@@ -250,93 +254,21 @@ def ensure_ssh_key():
 
     print("\n🔑 Your SSH public-key fingerprint (SHA256) is:\n")
     print(f"    SHA256:{fingerprint}\n")
-    print("✅ Will push this fingerprint as a TXT record (if in prod mode).\n")
+    print("✅ Will push this fingerprint as a TXT record via Cloudflare API—no manual step required.\n")
     return fingerprint
 
-# ─── 7) CLOUDflare DNS UPDATER ─────────────────────────────────────────────────
-def update_cloudflare(conf: dict, cname_target: str, txt_value: str):
-    """
-    Create/Update two DNS records in Cloudflare:
-      • CNAME:  <host>.<zone_name> → cname_target
-      • TXT:    <host>.<zone_name> → txt_value
-    """
-    token    = conf["cf_token"]
-    zone_id  = conf["zone_id"]
-    zone     = conf["zone_name"]
-    host     = conf["host"]
-    ttl      = conf.get("ttl", DEFAULT_TTL)
-    full_name = f"{host}.{zone}"
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type":  "application/json"
-    }
-
-    def upsert_record(record_type: str, content: str):
-        # 1) List existing record(s)
-        params = {"type": record_type, "name": full_name}
-        r = requests.get(
-            f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
-            params=params,
-            headers=headers,
-            timeout=10
-        )
-        data = r.json()
-        if not data.get("success"):
-            print(f"⚠ Cloudflare API error listing {record_type}: {json.dumps(data, indent=2)}")
-            return
-
-        existing = data.get("result", [])
-        payload = {
-            "type":    record_type,
-            "name":    full_name,
-            "content": content,
-            "ttl":     ttl,
-            "proxied": False
-        }
-
-        if existing:
-            rec_id = existing[0]["id"]
-            resp = requests.put(
-                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{rec_id}",
-                headers=headers,
-                json=payload,
-                timeout=10
-            )
-            resp_data = resp.json()
-            if resp_data.get("success"):
-                print(f"[Cloudflare] Updated {record_type} → {content} (TTL={ttl})")
-            else:
-                print(f"⚠ Cloudflare failed to update {record_type}: {json.dumps(resp_data, indent=2)}")
-        else:
-            resp = requests.post(
-                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
-                headers=headers,
-                json=payload,
-                timeout=10
-            )
-            resp_data = resp.json()
-            if resp_data.get("success"):
-                print(f"[Cloudflare] Created {record_type} → {content} (TTL={ttl})")
-            else:
-                print(f"⚠ Cloudflare failed to create {record_type}: {json.dumps(resp_data, indent=2)}")
-
-    # Upsert CNAME
-    upsert_record("CNAME", cname_target)
-    # Upsert TXT
-    upsert_record("TXT", txt_value)
-
-# ─── 8) CERTIFICATE GENERATION ─────────────────────────────────────────────────
+# ─── 7) CERTIFICATE GENERATION ─────────────────────────────────────────────────
 def generate_cert(cert_file: str, key_file: str, real_domain: str, tunnel_domain: str):
     """
-    Generate a multi‐SAN certificate covering:
+    Generate a multi-SAN certificate covering:
       • localhost
       • <LAN_IP>
-      • <real_domain>    (if provided; else omit)
-      • <tunnel_domain>  (Serveo hostname)
+      • <real_domain>   (e.g. chat.hypermindlabs.org)
+      • <tunnel_domain> (e.g. abc123.serveo.net)
       • 127.0.0.1
 
-    If mkcert is present, use it; otherwise fallback to a self‐signed from cryptography.
+    If mkcert is present, use it; otherwise fallback to a self-signed from cryptography.
     Overwrites existing files if present.
     """
     lan_ip = get_lan_ip()
@@ -347,29 +279,29 @@ def generate_cert(cert_file: str, key_file: str, real_domain: str, tunnel_domain
     if os.path.exists(key_file):
         os.remove(key_file)
 
-    names = ["localhost", lan_ip, tunnel_domain, "127.0.0.1"]
-    if real_domain:
-        names.insert(2, real_domain)
-
     if shutil.which("mkcert"):
         subprocess.run(["mkcert", "-install"], check=True)
-        cmd = ["mkcert", "-cert-file", cert_file, "-key-file", key_file] + names
-        subprocess.run(cmd, check=True)
+        subprocess.run([
+            "mkcert",
+            "-cert-file", cert_file,
+            "-key-file", key_file,
+            "localhost",
+            lan_ip,
+            real_domain,
+            tunnel_domain,
+            "127.0.0.1"
+        ], check=True)
         return
 
     keyobj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    san_entries = []
-    for n in names:
-        try:
-            # If it’s an IP address, use IPAddress
-            ipaddr = ipaddress.IPv4Address(n)
-            san_entries.append(x509.IPAddress(ipaddr))
-        except:
-            san_entries.append(x509.DNSName(n))
-
-    san = x509.SubjectAlternativeName(san_entries)
-    common_name = real_domain or tunnel_domain
-    name = x509.Name([ x509.NameAttribute(NameOID.COMMON_NAME, common_name) ])
+    san = x509.SubjectAlternativeName([
+        x509.DNSName("localhost"),
+        x509.DNSName(lan_ip),
+        x509.DNSName(real_domain),
+        x509.DNSName(tunnel_domain),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))
+    ])
+    name = x509.Name([ x509.NameAttribute(NameOID.COMMON_NAME, real_domain) ])
     cert = (
         x509.CertificateBuilder()
            .subject_name(name)
@@ -391,7 +323,8 @@ def generate_cert(cert_file: str, key_file: str, real_domain: str, tunnel_domain
     with open(cert_file, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
-# ─── 9) REVERSE PROXY HANDLER (local HTTPS→Node) ────────────────────────────────
+
+# ─── 8) REVERSE PROXY HANDLER (local HTTPS→Node) ────────────────────────────────
 class ReverseProxyHandler(BaseHTTPRequestHandler):
     """
     Any request arriving on https://localhost:9443 will be forwarded to
@@ -449,7 +382,8 @@ class ReverseProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(502, f"Bad Gateway: {e}")
 
-# ─── 10) START LOCAL DEV HTTPS (9443) ───────────────────────────────────────────
+
+# ─── 9) START LOCAL DEV HTTPS (9443) ───────────────────────────────────────────
 def start_local_https(cert_file: str, key_file: str, app_port: int):
     """
     If DEV_HTTPS_PORT (9443) is free, bind an HTTPS server there
@@ -469,26 +403,34 @@ def start_local_https(cert_file: str, key_file: str, app_port: int):
 
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
-# ─── 11) START SERVEO TUNNEL ─────────────────────────────────────────────────────
-def start_serveo_tunnel(timeout: int, app_port: int) -> str:
+
+# ─── 10) START SERVEO TUNNEL ─────────────────────────────────────────────────────
+def start_serveo_tunnel(timeout: int, app_port: int, real_domain: str=None) -> str:
     """
-    Run:
-      ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes \
-          -R 80:localhost:{app_port} serveo.net
+    Run either:
+      • ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R 80:localhost:<app_port> serveo.net        (DEV mode),
+      • or ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R <real_domain>:80:localhost:<app_port> serveo.net   (PROD mode).
 
     Wait up to `timeout` seconds for a line like:
-      "Forwarding HTTP traffic from https://<subdomain>.serveo.net to localhost:{app_port}"
-    If found, return "<subdomain>.serveo.net". Else kill the SSH process and return None.
+      "Forwarding HTTP traffic from https://<hostname> to localhost:<app_port>"
+    If found, return "<hostname>". Else kill SSH and return None.
     """
     if shutil.which("ssh") is None:
         print("⚠ `ssh` not found; cannot establish Serveo tunnel.")
         return None
 
+    if real_domain:
+        # PRODUCTION: ask Serveo to bind custom domain
+        forward_arg = f"{real_domain}:80:localhost:{app_port}"
+    else:
+        # DEV: random ephemeral subdomain
+        forward_arg = f"80:localhost:{app_port}"
+
     cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ExitOnForwardFailure=yes",
-        "-R", f"80:localhost:{app_port}",
+        "-R", forward_arg,
         "serveo.net"
     ]
     try:
@@ -505,7 +447,9 @@ def start_serveo_tunnel(timeout: int, app_port: int) -> str:
             line = p.stdout.readline()
             if not line:
                 continue
-            m = re.search(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+\.serveo\.net)", line)
+            # For DEV: “Forwarding HTTP traffic from https://xyz123.serveo.net to localhost:<port>”
+            # For PROD: “Forwarding HTTP traffic from https://chat.example.com to localhost:<port>”
+            m = re.search(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+)", line)
             if m:
                 host = m.group(1).strip()
                 break
@@ -521,24 +465,105 @@ def start_serveo_tunnel(timeout: int, app_port: int) -> str:
     print(f"✅ Serveo tunnel established: https://{host}")
     return host
 
+
+# ─── 11) UPDATE CLOUDFLARE CNAME + TXT ───────────────────────────────────────────
+def update_cloudflare(conf: dict, cname_target: str, txt_value: str):
+    """
+    Use Cloudflare’s API to set/update two DNS records in the specified zone:
+      1) CNAME record at <host>.<zone_name> → serveo.net (i.e. cname_target = "serveo.net")
+      2) TXT    record at _serveo-authkey.<host>.<zone_name> → txt_value
+
+    Both are applied individually via Cloudflare API.
+    """
+    token    = conf["cf_token"]
+    zone_id  = conf["zone_id"]
+    zone     = conf["zone_name"]
+    host     = conf["host"]
+    ttl      = conf.get("ttl", DEFAULT_TTL)
+
+    full_name       = f"{host}.{zone}"
+    txt_record_name = f"_serveo-authkey.{host}.{zone}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json"
+    }
+
+    def upsert_record(record_type: str, name: str, content: str, proxied: bool=False):
+        # 1) Check if an existing record exists
+        params = {
+            "type": record_type,
+            "name": name
+        }
+        r = requests.get(
+            f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+        data = r.json()
+        if not data.get("success"):
+            print(f"⚠ Cloudflare API error listing {record_type} records for {name}: {data}")
+            return
+
+        existing = data.get("result", [])
+        payload = {
+            "type":    record_type,
+            "name":    name,
+            "content": content,
+            "ttl":     ttl,
+            "proxied": proxied if record_type == "CNAME" else False
+        }
+
+        if existing:
+            rec_id = existing[0]["id"]
+            resp = requests.put(
+                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{rec_id}",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+            resp_data = resp.json()
+            if resp_data.get("success"):
+                print(f"[Cloudflare] Updated {record_type} record {name} → {content}  (TTL={ttl})")
+            else:
+                print(f"⚠ Cloudflare failed to update {record_type} {name}: {resp_data}")
+        else:
+            resp = requests.post(
+                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+            resp_data = resp.json()
+            if resp_data.get("success"):
+                print(f"[Cloudflare] Created {record_type} record {name} → {content}  (TTL={ttl})")
+            else:
+                print(f"⚠ Cloudflare failed to create {record_type} {name}: {resp_data}")
+
+    # Upsert CNAME: chat.example.com → serveo.net  (proxied=False)
+    upsert_record("CNAME", full_name, cname_target, proxied=False)
+
+    # Upsert TXT: _serveo-authkey.chat.example.com → SHA256:<fingerprint>
+    upsert_record("TXT", txt_record_name, txt_value, proxied=False)
+
+
 # ─── 12) HEALTH-CHECK ROUTINES ──────────────────────────────────────────────────
-def self_test_once(real_domain: str, app_port: int, mode: str):
+def self_test_once(real_domain: str, app_port: int):
     """
     Run one round of health checks:
       1) http://127.0.0.1:<app_port>/
       2) https://localhost:9443/
       3) https://<LAN_IP>:9443/
-      4) if prod: https://<real_domain>/
+      4) https://<real_domain>/
     """
     lan_ip = get_lan_ip()
     tests = [
         (f"http://127.0.0.1:{app_port}/",        False),
         (f"https://localhost:{DEV_HTTPS_PORT}/", False),
         (f"https://{lan_ip}:{DEV_HTTPS_PORT}/",  False),
+        (f"https://{real_domain}/",              False),
     ]
-    if mode == "prod":
-        tests.append((f"https://{real_domain}/", False))
-
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Health-check:")
     for url, verify in tests:
         try:
@@ -547,13 +572,14 @@ def self_test_once(real_domain: str, app_port: int, mode: str):
         except Exception as e:
             print(f"  [HEALTHCHK] {url} → ERROR: {e}")
 
-def continuous_healthcheck(real_domain: str, app_port: int, mode: str, interval: int = 60):
+def continuous_healthcheck(real_domain: str, app_port: int, interval: int = 60):
     """
     Loop forever, calling self_test_once every `interval` seconds.
     """
     while True:
-        self_test_once(real_domain, app_port, mode)
+        self_test_once(real_domain, app_port)
         time.sleep(interval)
+
 
 # ─── 13) MAIN ──────────────────────────────────────────────────────────────────
 def main():
@@ -564,17 +590,11 @@ def main():
         save_config(cfg)
     os.chdir(cfg["serve_path"])
 
-    # 13.2) Load domain_conf (dev/prod + details)
+    # 13.2) Load domain.conf → either 'mode':'dev' or 'mode':'prod'
     nc = load_domain_conf()
-    mode = nc.get("mode", "dev")  # "dev" or "prod"
-    real_domain = None
-    if mode == "prod":
-        real_domain = f"{nc['host']}.{nc['zone_name']}"
+    mode = nc.get("mode", "dev")
 
-    # 13.3) Ensure we have an SSH keypair + get its fingerprint
-    fingerprint = ensure_ssh_key()
-
-    # 13.4) Pick a free app_port (start at 3000, go up if in use)
+    # 13.3) Pick a free app_port (start at 3000, increment if busy)
     app_port = BASE_APP_PORT
     while port_in_use(app_port):
         print(f"⚠ Port {app_port} in use; trying {app_port+1} …")
@@ -583,9 +603,9 @@ def main():
             print("⚠ Could not find a free port in the 3000–3020 range. Exiting.")
             sys.exit(1)
     if app_port != BASE_APP_PORT:
-        print(f"ℹ  Will use port {app_port} for your Node app (3000 was busy).")
+        print(f"ℹ Will use port {app_port} for your Node app (3000 was busy).")
 
-    # 13.5) Launch Node app on chosen port (plain HTTP)
+    # 13.4) Launch Node app on chosen port (plain HTTP)
     proc = None
     if os.path.exists("package.json") and os.path.exists("server.js") and shutil.which("node"):
         print("⏳ Installing npm dependencies…")
@@ -610,61 +630,67 @@ def main():
     else:
         print("⚠ No `package.json`/`server.js` found or `node` missing; skipping Node launch.")
 
-    # 13.6) Establish Serveo tunnel (10s timeout) → obtains <xyz>.serveo.net
-    print("⏳ Starting Serveo tunnel (10s timeout) …")
-    tunnel_host = start_serveo_tunnel(timeout=10, app_port=app_port)
+    # 13.5) Set up SSH key + fingerprint (needed in both DEV & PROD)
+    fingerprint = ensure_ssh_key()
+    fingerprint_value = f"SHA256:{fingerprint}"
+
+    # 13.6) If PRODUCTION: update Cloudflare DNS first
+    real_domain = None
+    if mode == "prod":
+        zone = nc["zone_name"]
+        host = nc["host"]
+        real_domain = f"{host}.{zone}"
+        print(f"⏳ Updating Cloudflare DNS for {real_domain} (CNAME→serveo.net, TXT→{fingerprint_value}) …")
+        update_cloudflare(nc, "serveo.net", fingerprint_value)
+
+        # Wait ~60 seconds for DNS to propagate
+        print(f"\n⏳ Waiting 60 seconds for DNS to propagate … (Cloudflare TTL is {nc.get('ttl', DEFAULT_TTL)} s)")
+        time.sleep(60)
+
+    # 13.7) Establish Serveo tunnel (10s timeout) 
+    # DEV: no real_domain passed → random ephemeral. 
+    # PROD: pass real_domain → bind custom domain
+    print("⏳ Starting Serveo tunnel (10s timeout)…")
+    tunnel_host = start_serveo_tunnel(timeout=10, app_port=app_port, real_domain=real_domain)
+
     if not tunnel_host:
         print("⚠ Serveo tunnel failed or timed out. Exiting.")
         if proc:
             proc.terminate()
         sys.exit(1)
 
-    # 13.7) If prod: update Cloudflare DNS
+    # 13.8) If PROD: schedule a re-update of Cloudflare in 5 minutes 
     if mode == "prod":
-        print("⏳ Updating Cloudflare DNS for", real_domain,
-              f"(CNAME→{tunnel_host}, TXT→SHA256:{fingerprint}) …")
-        update_cloudflare(nc, tunnel_host, f"SHA256:{fingerprint}")
-        print("\n⏳ Waiting 60 seconds for DNS to propagate … (Cloudflare TTL is", nc.get("ttl", DEFAULT_TTL), "s)")
-        time.sleep(60)
+        threading.Thread(
+            target=lambda: (time.sleep(300), update_cloudflare(nc, "serveo.net", fingerprint_value)),
+            daemon=True
+        ).start()
 
-    # 13.8) Generate TLS certificate:
-    #  • In dev: real_domain=None, so we only cover localhost, LAN IP, tunnel_host, 127.0.0.1
-    #  • In prod: we cover localhost, LAN IP, real_domain, tunnel_host, 127.0.0.1
+    # 13.9) Generate TLS certificate for local dev testing
     cert_file = os.path.join(cfg["serve_path"], "cert.pem")
     key_file  = os.path.join(cfg["serve_path"], "key.pem")
-    generate_cert(cert_file, key_file, real_domain, tunnel_host)
+    # In DEV mode, real_domain is None → pass a dummy; we only care about SAN for random tunnel
+    san_domain = tunnel_host if not real_domain else real_domain
+    generate_cert(cert_file, key_file, san_domain, tunnel_host)
 
-    # 13.9) Start local dev HTTPS on port 9443 (reverse→ Node)
+    # 13.10) Start local dev HTTPS on 9443 → Node
     start_local_https(cert_file, key_file, app_port)
 
-    # 13.10) Print final banner
+    # 13.11) Print final banner
     lan_ip = get_lan_ip()
-    banner_domain = real_domain if mode == "prod" else tunnel_host
-    print_banner(lan_ip, banner_domain, app_port, mode)
-    if mode == "prod":
-        print(f"✅ Production will be accessible at: https://{real_domain} (via Serveo → {tunnel_host})\n")
-    else:
-        print(f"✅ Dev (Serveo) will be accessible at: https://{tunnel_host}\n")
+    final_domain = san_domain if mode=="prod" else tunnel_host
+    print_banner(lan_ip, final_domain, app_port)
+    print(f"✅ {'Development' if mode=='dev' else 'Production'} will be accessible at: https://{final_domain} (via Serveo → {tunnel_host})\n")
+    print("⚠ All services started. Press Ctrl+C to terminate.")
 
-    # 13.11) Spawn health-check thread (every 60 seconds)
+    # 13.12) Spawn health-check thread
     health_thread = threading.Thread(
-        target=lambda: continuous_healthcheck(real_domain or tunnel_host, app_port, mode, interval=60),
+        target=lambda: continuous_healthcheck(final_domain, app_port, interval=60),
         daemon=True
     )
     health_thread.start()
 
-    # 13.12) If prod: schedule a re-run of DNS update in 5 minutes (in case Serveo host changes)
-    if mode == "prod":
-        threading.Thread(
-            target=lambda: (
-                time.sleep(300),
-                update_cloudflare(nc, tunnel_host, f"SHA256:{fingerprint}")
-            ),
-            daemon=True
-        ).start()
-
     # 13.13) Block main thread until Ctrl+C
-    print("⚠  All services started. Press Ctrl+C to terminate.")
     try:
         while True:
             time.sleep(1)
@@ -673,6 +699,7 @@ def main():
         if proc:
             proc.terminate()
         sys.exit(0)
+
 
 if __name__ == "__main__":
     bootstrap_and_run()
