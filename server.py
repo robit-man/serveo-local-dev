@@ -13,6 +13,7 @@ import ipaddress
 import urllib.request
 import re
 import select
+import signal
 
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -41,6 +42,19 @@ DEV_HTTPS_PORT = 9443
 # Default TTL for Cloudflare DNS records (seconds)
 DEFAULT_TTL    = 300
 
+# Health-check interval (seconds)
+HEALTH_INTERVAL = 60
+
+# How many consecutive failures before restarting tunnel
+MAX_FAILURES = 5
+
+# Global handles so we can terminate on Ctrl+C
+node_proc   = None
+tunnel_proc = None
+tunnel_host = None
+
+# Lock to synchronize tunnel restarts
+tunnel_lock = threading.Lock()
 
 # ─── SPINNER (for long installs) ───────────────────────────────────────────────
 class Spinner:
@@ -102,12 +116,12 @@ def save_config(cfg):
 # ─── 3) DOMAIN.CONF I/O ────────────────────────────────────────────────────────
 def create_domain_conf():
     """
-    Prompt user to choose DEV vs PRODUCTION. 
-    If PRODUCTION, ask for Cloudflare API token + zone name + subdomain + TTL. 
+    Prompt user to choose DEV vs PRODUCTION.
+    If PRODUCTION, ask for Cloudflare API token + zone name + subdomain + TTL.
     Save these in domain.conf.
     """
     print("\n⚠  Do you want to run in DEV mode or PRODUCTION mode?")
-    print("   1) DEV (no Cloudflare, just random Serveo subdomain)")
+    print("   1) DEV (no Cloudflare, just random tunnel subdomain)")
     print("   2) PRODUCTION (Cloudflare + custom subdomain)")
     choice = input("Enter 1 or 2: ").strip()
     if choice not in ("1", "2"):
@@ -116,9 +130,7 @@ def create_domain_conf():
 
     if choice == "1":
         # DEV mode: no DNS changes needed
-        conf = {
-            "mode": "dev"
-        }
+        conf = {"mode": "dev"}
         with open(DOMAIN_CONF, "w") as f:
             json.dump(conf, f, indent=4)
         print("\n✅ Running in DEV mode. No DNS changes will be made.\n")
@@ -244,7 +256,6 @@ def ensure_ssh_key():
             ["ssh-keygen", "-lf", pubkey_path, "-E", "sha256"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-        # Typical output: "2048 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz1234567890abcdef user@host (RSA)"
         m = re.search(r"SHA256:([A-Za-z0-9+/=]+)", out)
         if not m:
             raise RuntimeError(f"Could not parse fingerprint from: {out}")
@@ -265,7 +276,7 @@ def generate_cert(cert_file: str, key_file: str, real_domain: str, tunnel_domain
       • localhost
       • <LAN_IP>
       • <real_domain>   (e.g. chat.hypermindlabs.org)
-      • <tunnel_domain> (e.g. abc123.serveo.net)
+      • <tunnel_domain> (e.g. abc123.lhr.gg)
       • 127.0.0.1
 
     If mkcert is present, use it; otherwise fallback to a self-signed from cryptography.
@@ -404,40 +415,22 @@ def start_local_https(cert_file: str, key_file: str, app_port: int):
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 
-# ─── 10) START SERVEO TUNNEL ─────────────────────────────────────────────────────
-def start_serveo_tunnel(timeout: int, app_port: int, real_domain: str=None) -> str:
+# ─── 10) GENERIC TUNNEL LAUNCHER ─────────────────────────────────────────────────
+def _spawn_and_capture(cmd, regex_list, timeout):
     """
-    Run either:
-      • ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R 80:localhost:<app_port> serveo.net        (DEV mode),
-      • or ssh -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R <real_domain>:80:localhost:<app_port> serveo.net   (PROD mode).
-
-    Wait up to `timeout` seconds for a line like:
-      "Forwarding HTTP traffic from https://<hostname> to localhost:<app_port>"
-    If found, return "<hostname>". Else kill SSH and return None.
+    Run subprocess cmd, capture stdout/err lines until one of regex_list matches.
+    Returns (matched hostname, process) or (None, None) on failure/timeout.
     """
-    if shutil.which("ssh") is None:
-        print("⚠ `ssh` not found; cannot establish Serveo tunnel.")
-        return None
-
-    if real_domain:
-        # PRODUCTION: ask Serveo to bind custom domain
-        forward_arg = f"{real_domain}:80:localhost:{app_port}"
-    else:
-        # DEV: random ephemeral subdomain
-        forward_arg = f"80:localhost:{app_port}"
-
-    cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ExitOnForwardFailure=yes",
-        "-R", forward_arg,
-        "serveo.net"
-    ]
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception as e:
-        print(f"⚠ Failed to start SSH: {e}")
-        return None
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid
+        )
+    except Exception:
+        return None, None
 
     host = None
     deadline = time.time() + timeout
@@ -447,30 +440,253 @@ def start_serveo_tunnel(timeout: int, app_port: int, real_domain: str=None) -> s
             line = p.stdout.readline()
             if not line:
                 continue
-            # For DEV: “Forwarding HTTP traffic from https://xyz123.serveo.net to localhost:<port>”
-            # For PROD: “Forwarding HTTP traffic from https://chat.example.com to localhost:<port>”
-            m = re.search(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+)", line)
-            if m:
-                host = m.group(1).strip()
+            for pattern in regex_list:
+                m = pattern.search(line)
+                if m:
+                    host = m.group(1).strip()
+                    break
+            if host:
                 break
 
     if not host:
         try:
-            p.kill()
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except:
             pass
-        print("⚠ Serveo tunnel failed or timed out.")
-        return None
+        return None, None
 
-    print(f"✅ Serveo tunnel established: https://{host}")
-    return host
+    return host, p
+
+
+def clean_label(s: str) -> str:
+    """
+    Replace any non-alphanumeric with '-', collapse multiple '-' into one,
+    strip leading/trailing '-'.
+    E.g. "hypermindlabs.org" → "hypermindlabs-org"
+    """
+    tmp = re.sub(r'[^A-Za-z0-9]', '-', s)
+    tmp = re.sub(r'-+', '-', tmp)
+    return tmp.strip('-')
+
+
+def start_tunnel_chain(timeout: int, app_port: int, host: str = None, zone_name: str = None):
+    """
+    Try LocalTunnel first (with custom subdomain if host+zone_name present), then fall back:
+      1) LocalTunnel (Node.js 'lt')
+      2) Serveo (SSH)
+      3) localhost.run (SSH)
+      4) nglocalhost.com (SSH)
+      5) Staqlab Tunnel (CLI)
+      6) Cloudflare TryCloudflare (cloudflared)
+
+    If host and zone_name are provided, we clean both (strip punctuation → dashes)
+    and form desired_sub = "<host_clean>-<zone_clean>". We attempt that first;
+    if unavailable, we then try a random LT host before falling back to other services.
+
+    Returns (matched_hostname, process) or (None, None) on complete failure.
+    """
+    patterns = {
+        "localtunnel":   re.compile(r"your url is:\s+https?://([\w\-.]+(?:\.loca\.lt|\.localtunnel\.me))", re.IGNORECASE),
+        "serveo":        re.compile(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+)"),
+        "localhost_run": re.compile(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+\.lhr\.gg|[\w\-.]+\.localhost\.run)"),
+        "nglocal":       re.compile(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+\.nglocalhost\.com)"),
+        "staqlab":       re.compile(r"(?:https?://)?([\w\-.]+\.staqlab\.net)"),
+        "cloudflare":    re.compile(r"https?://([\w\-.]+\.trycloudflare\.com)")
+    }
+
+    # ─────────────────────────────
+    # 1) LocalTunnel (custom then random)
+    # ─────────────────────────────
+    if shutil.which("lt"):
+        desired_sub = None
+        if host and zone_name:
+            print(f"→ domain.conf provided: host='{host}', zone_name='{zone_name}'")
+            zone_base  = zone_name.split('.')[0]
+            host_clean = clean_label(host)
+            zone_clean = clean_label(zone_base)
+            desired_sub = f"{host_clean}-{zone_clean}"
+            print(f"→ Attempting LocalTunnel with custom subdomain: '{desired_sub}'")
+            cmd = ["lt", "--port", str(app_port), "--subdomain", desired_sub]
+        else:
+            print("→ No host+zone_name available → using random LocalTunnel subdomain")
+            cmd = ["lt", "--port", str(app_port)]
+
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid
+        )
+        tunnel_proc_local = p
+
+        host_assigned = None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready, _, _ = select.select([p.stdout], [], [], 0.5)
+            if ready:
+                line = p.stdout.readline()
+                if not line:
+                    continue
+
+                # If our desired_sub is taken, LT prints “Subdomain <…> is not available”
+                if desired_sub and "Subdomain" in line and ("not available" in line or "already in use" in line):
+                    print(f"⚠ LocalTunnel: '{desired_sub}' unavailable → {line.strip()}")
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    host_assigned = None
+                    break
+
+                # Look for "your url is: https://<host>"
+                m = patterns["localtunnel"].search(line)
+                if m:
+                    host_assigned = m.group(1).strip()
+                    break
+
+        if host_assigned:
+            if desired_sub:
+                if host_assigned.startswith(desired_sub + "."):
+                    print(f"✅ LocalTunnel (custom) established: https://{host_assigned}")
+                    return host_assigned, tunnel_proc_local
+                else:
+                    print(f"⚠ LocalTunnel assigned random host '{host_assigned}' instead of '{desired_sub}'")
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    # fall through to random logic below
+            else:
+                print(f"✅ LocalTunnel established: https://{host_assigned}")
+                return host_assigned, tunnel_proc_local
+
+        # If custom failed or yielded random
+        if desired_sub:
+            print("→ Now trying LocalTunnel with a truly random subdomain…")
+            p2 = subprocess.Popen(
+                ["lt", "--port", str(app_port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                preexec_fn=os.setsid
+            )
+            tunnel_proc_local2 = p2
+
+            host_random = None
+            deadline2 = time.time() + timeout
+            while time.time() < deadline2:
+                ready2, _, _ = select.select([p2.stdout], [], [], 0.5)
+                if ready2:
+                    line2 = p2.stdout.readline()
+                    if not line2:
+                        continue
+                    m2 = patterns["localtunnel"].search(line2)
+                    if m2:
+                        host_random = m2.group(1).strip()
+                        break
+
+            if host_random:
+                print(f"✅ LocalTunnel (random) established: https://{host_random}")
+                return host_random, tunnel_proc_local2
+            else:
+                try:
+                    os.killpg(os.getpgid(p2.pid), signal.SIGTERM)
+                except:
+                    pass
+
+        print("⚠ LocalTunnel failed; trying next service…")
+
+    # ─────────────────────────────
+    # 2) Serveo (SSH)
+    # ─────────────────────────────
+    if shutil.which("ssh"):
+        if host and zone_name:
+            desired = f"{host}.{zone_name}"
+            print(f"→ Attempting Serveo with custom host '{desired}'")
+            forward = f"{desired}:80:localhost:{app_port}"
+        else:
+            print("→ Attempting Serveo with random host")
+            forward = f"80:localhost:{app_port}"
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", forward,
+            "serveo.net"
+        ]
+        service_host, proc = _spawn_and_capture(cmd, [patterns["serveo"]], timeout)
+        if service_host:
+            print(f"✅ Serveo tunnel established: https://{service_host}")
+            return service_host, proc
+        print("⚠ Serveo failed; trying next service…")
+
+    # ─────────────────────────────
+    # 3) localhost.run (SSH)
+    # ─────────────────────────────
+    if shutil.which("ssh"):
+        print("→ Attempting localhost.run (random)")
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"80:localhost:{app_port}",
+            "localhost.run"
+        ]
+        service_host, proc = _spawn_and_capture(cmd, [patterns["localhost_run"]], timeout)
+        if service_host:
+            print(f"✅ localhost.run tunnel established: https://{service_host}")
+            return service_host, proc
+        print("⚠ localhost.run failed; trying next service…")
+
+    # ─────────────────────────────
+    # 4) nglocalhost.com (SSH)
+    # ─────────────────────────────
+    if shutil.which("ssh"):
+        print("→ Attempting nglocalhost.com (random)")
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"80:localhost:{app_port}",
+            "nglocalhost.com"
+        ]
+        service_host, proc = _spawn_and_capture(cmd, [patterns["nglocal"]], timeout)
+        if service_host:
+            print(f"✅ nglocalhost tunnel established: https://{service_host}")
+            return service_host, proc
+        print("⚠ nglocalhost failed; trying next service…")
+
+    # ─────────────────────────────
+    # 5) Staqlab Tunnel (CLI)
+    # ─────────────────────────────
+    if shutil.which("staqlab-tunnel"):
+        if host:
+            print(f"→ Attempting Staqlab Tunnel with custom hostname '{host}'")
+            cmd = ["staqlab-tunnel", str(app_port), f"hostname={host}"]
+        else:
+            print("→ Attempting Staqlab Tunnel (random)")
+            cmd = ["staqlab-tunnel", str(app_port)]
+        service_host, proc = _spawn_and_capture(cmd, [patterns["staqlab"]], timeout)
+        if service_host:
+            print(f"✅ Staqlab tunnel established: https://{service_host}")
+            return service_host, proc
+        print("⚠ Staqlab failed; trying next service…")
+
+    # ─────────────────────────────
+    # 6) Cloudflare TryCloudflare (cloudflared)
+    # ─────────────────────────────
+    if shutil.which("cloudflared"):
+        print("→ Attempting Cloudflare TryCloudflare (random)")
+        cmd = ["cloudflared", "tunnel", "--url", f"http://localhost:{app_port}", "--no-autoupdate"]
+        service_host, proc = _spawn_and_capture(cmd, [patterns["cloudflare"]], timeout)
+        if service_host:
+            print(f"✅ Cloudflare tunnel established: https://{service_host}")
+            return service_host, proc
+        print("⚠ Cloudflare trycloudflare failed; no more fallbacks available.")
+
+    return None, None
 
 
 # ─── 11) UPDATE CLOUDFLARE CNAME + TXT ───────────────────────────────────────────
 def update_cloudflare(conf: dict, cname_target: str, txt_value: str):
     """
     Use Cloudflare’s API to set/update two DNS records in the specified zone:
-      1) CNAME record at <host>.<zone_name> → serveo.net (i.e. cname_target = "serveo.net")
+      1) CNAME record at <host>.<zone_name> → cname_target
       2) TXT    record at _serveo-authkey.<host>.<zone_name> → txt_value
 
     Both are applied individually via Cloudflare API.
@@ -490,7 +706,6 @@ def update_cloudflare(conf: dict, cname_target: str, txt_value: str):
     }
 
     def upsert_record(record_type: str, name: str, content: str, proxied: bool=False):
-        # 1) Check if an existing record exists
         params = {
             "type": record_type,
             "name": name
@@ -541,60 +756,126 @@ def update_cloudflare(conf: dict, cname_target: str, txt_value: str):
             else:
                 print(f"⚠ Cloudflare failed to create {record_type} {name}: {resp_data}")
 
-    # Upsert CNAME: chat.example.com → serveo.net  (proxied=False)
+    # Upsert CNAME: <host>.<zone_name> → cname_target (proxied=False)
     upsert_record("CNAME", full_name, cname_target, proxied=False)
 
-    # Upsert TXT: _serveo-authkey.chat.example.com → SHA256:<fingerprint>
+    # Upsert TXT: _serveo-authkey.<host>.<zone_name> → SHA256:<fingerprint>
     upsert_record("TXT", txt_record_name, txt_value, proxied=False)
 
 
-# ─── 12) HEALTH-CHECK ROUTINES ──────────────────────────────────────────────────
-def self_test_once(real_domain: str, app_port: int):
+# ─── 12) HEARTBEAT / TUNNEL MONITOR ─────────────────────────────────────────────
+def tunnel_health_monitor(check_url: str, app_port: int, conf: dict):
     """
-    Run one round of health checks:
-      1) http://127.0.0.1:<app_port>/
-      2) https://localhost:9443/
-      3) https://<LAN_IP>:9443/
-      4) https://<real_domain>/
+    Periodically check the tunnel URL. If it fails consecutively MAX_FAILURES times,
+    restart the tunnel, update DNS if in prod, regenerate certs, and resume checks.
     """
-    lan_ip = get_lan_ip()
-    tests = [
-        (f"http://127.0.0.1:{app_port}/",        False),
-        (f"https://localhost:{DEV_HTTPS_PORT}/", False),
-        (f"https://{lan_ip}:{DEV_HTTPS_PORT}/",  False),
-        (f"https://{real_domain}/",              False),
-    ]
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Health-check:")
-    for url, verify in tests:
-        try:
-            r = requests.get(url, timeout=5, verify=verify)
-            print(f"  [HEALTHCHK] {url} → {r.status_code}")
-        except Exception as e:
-            print(f"  [HEALTHCHK] {url} → ERROR: {e}")
+    global tunnel_proc, tunnel_host
 
-def continuous_healthcheck(real_domain: str, app_port: int, interval: int = 60):
-    """
-    Loop forever, calling self_test_once every `interval` seconds.
-    """
+    failures = 0
     while True:
-        self_test_once(real_domain, app_port)
-        time.sleep(interval)
+        try:
+            resp = urllib.request.urlopen(check_url, timeout=5)
+            status = getattr(resp, 'status', None) or resp.getcode()
+            if status == 200:
+                failures = 0
+                print(f"✅ Tunnel heartbeat OK: {check_url}")
+            else:
+                failures += 1
+                print(f"⚠ Tunnel heartbeat HTTP {status} ({failures}/{MAX_FAILURES})")
+        except Exception as e:
+            failures += 1
+            print(f"⚠ Tunnel heartbeat failed ({failures}/{MAX_FAILURES}): {e}")
+
+        if failures >= MAX_FAILURES:
+            print(f"‼️  Tunnel unreachable {MAX_FAILURES}×; restarting tunnel…")
+            with tunnel_lock:
+                # Terminate old tunnel
+                if tunnel_proc:
+                    try:
+                        os.killpg(os.getpgid(tunnel_proc.pid), signal.SIGTERM)
+                    except:
+                        pass
+
+                # Restart tunnel
+                new_host, new_proc = start_tunnel_chain(
+                    timeout=10,
+                    app_port=app_port,
+                    host=conf.get("host"),
+                    zone_name=conf.get("zone_name")
+                )
+                if not new_host:
+                    print("⚠ Failed to re-establish tunnel; will retry in next cycle.")
+                    failures = 0
+                    time.sleep(HEALTH_INTERVAL)
+                    continue
+
+                tunnel_host = new_host
+                tunnel_proc = new_proc
+                print(f"🔄 New tunnel established: https://{tunnel_host}")
+
+                # Update DNS if in prod
+                if conf.get("mode") == "prod" and conf.get("host") and conf.get("zone_name"):
+                    real_domain = f"{conf['host']}.{conf['zone_name']}"
+                    fingerprint = ensure_ssh_key()
+                    fingerprint_value = f"SHA256:{fingerprint}"
+                    print(f"\n⏳ Updating Cloudflare DNS for {real_domain} (CNAME→{tunnel_host}, TXT→{fingerprint_value}) …")
+                    update_cloudflare(conf, tunnel_host, fingerprint_value)
+
+                # Regenerate cert
+                cert_file = os.path.join(conf.get("serve_path", SCRIPT_DIR), "cert.pem")
+                key_file  = os.path.join(conf.get("serve_path", SCRIPT_DIR), "key.pem")
+                san_domain = real_domain if conf.get("host") and conf.get("zone_name") else tunnel_host
+                generate_cert(cert_file, key_file, san_domain, tunnel_host)
+
+                # Update check_url
+                check_url = f"https://{tunnel_host}/"
+
+                failures = 0
+                print(f"✅ Tunnel rotated successfully: {check_url}")
+
+        time.sleep(HEALTH_INTERVAL)
 
 
-# ─── 13) MAIN ──────────────────────────────────────────────────────────────────
+# ─── 13) SIGNAL HANDLER FOR GRACEFUL SHUTDOWN ───────────────────────────────────
+def handle_sigint(signum, frame):
+    global node_proc, tunnel_proc
+    print("\nReceived Ctrl+C; shutting down…")
+    if node_proc:
+        try:
+            os.killpg(os.getpgid(node_proc.pid), signal.SIGTERM)
+        except:
+            pass
+    if tunnel_proc:
+        try:
+            os.killpg(os.getpgid(tunnel_proc.pid), signal.SIGTERM)
+        except:
+            pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+
+# ─── 14) MAIN ──────────────────────────────────────────────────────────────────
 def main():
-    # 13.1) Load (or create) config, then chdir to serve_path
+    global node_proc, tunnel_proc, tunnel_host
+
+    # 14.1) Load (or create) config, then chdir to serve_path
     cfg = load_config()
     if not os.path.exists(CONFIG_PATH):
         cfg["serve_path"] = input(f"Serve path [{cfg['serve_path']}]: ") or cfg["serve_path"]
         save_config(cfg)
     os.chdir(cfg["serve_path"])
 
-    # 13.2) Load domain.conf → either 'mode':'dev' or 'mode':'prod'
+    # 14.2) Load domain.conf → attempt to extract host and zone_name regardless of mode
     nc = load_domain_conf()
-    mode = nc.get("mode", "dev")
+    host      = nc.get("host")
+    zone_name = nc.get("zone_name")
+    mode      = nc.get("mode", "dev")
 
-    # 13.3) Pick a free app_port (start at 3000, increment if busy)
+    # Debug: show exactly what loaded
+    print(f"→ Loaded domain.conf → mode='{mode}', host='{host}', zone_name='{zone_name}'")
+
+    # 14.3) Pick a free app_port (start at 3000, increment if busy)
     app_port = BASE_APP_PORT
     while port_in_use(app_port):
         print(f"⚠ Port {app_port} in use; trying {app_port+1} …")
@@ -605,8 +886,7 @@ def main():
     if app_port != BASE_APP_PORT:
         print(f"ℹ Will use port {app_port} for your Node app (3000 was busy).")
 
-    # 13.4) Launch Node app on chosen port (plain HTTP)
-    proc = None
+    # 14.4) Launch Node app on chosen port (plain HTTP)
     if os.path.exists("package.json") and os.path.exists("server.js") and shutil.which("node"):
         print("⏳ Installing npm dependencies…")
         subprocess.check_call(["npm", "install"], cwd=cfg["serve_path"])
@@ -617,12 +897,14 @@ def main():
         except:
             log_file = subprocess.DEVNULL
 
-        proc = subprocess.Popen(
+        # Launch Node in its own process group
+        node_proc = subprocess.Popen(
             ["npm", "run", "start"],
             cwd=cfg["serve_path"],
             stdout=log_file,
             stderr=log_file,
-            env={**os.environ, "PORT": str(app_port)}
+            env={**os.environ, "PORT": str(app_port)},
+            preexec_fn=os.setsid
         )
         # Give Node a moment to spin up
         time.sleep(2)
@@ -630,75 +912,132 @@ def main():
     else:
         print("⚠ No `package.json`/`server.js` found or `node` missing; skipping Node launch.")
 
-    # 13.5) Set up SSH key + fingerprint (needed in both DEV & PROD)
+    # 14.5) Set up SSH key + fingerprint (needed in both DEV & PROD)
     fingerprint = ensure_ssh_key()
     fingerprint_value = f"SHA256:{fingerprint}"
 
-    # 13.6) If PRODUCTION: update Cloudflare DNS first
+    # 14.6) If zone_name+host exist, we’ll do DNS update after Serveo
     real_domain = None
-    if mode == "prod":
-        zone = nc["zone_name"]
-        host = nc["host"]
-        real_domain = f"{host}.{zone}"
-        print(f"⏳ Updating Cloudflare DNS for {real_domain} (CNAME→serveo.net, TXT→{fingerprint_value}) …")
+    if host and zone_name:
+        real_domain = f"{host}.{zone_name}"
+        print(f"\n⏳ Will establish Serveo tunnel (using host+zone_name) before updating Cloudflare DNS…\n")
+    else:
+        print("\n⏳ Establishing Serveo tunnel without custom host/zone_name…\n")
+
+    # 14.7) Establish Serveo first (10s timeout)
+    print("⏳ Starting tunnel chain (Serveo first, 10s timeout)…")
+    serveo_patterns = [re.compile(r"Forwarding\s+HTTP\s+traffic\s+from\s+https?://([\w\-.]+)")]
+    if shutil.which("ssh"):
+        if host and zone_name:
+            desired = f"{host}.{zone_name}"
+            print(f"→ Attempting Serveo with custom host '{desired}'")
+            forward = f"{desired}:80:localhost:{app_port}"
+        else:
+            print("→ Attempting Serveo with random host")
+            forward = f"80:localhost:{app_port}"
+        serveo_cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", forward,
+            "serveo.net"
+        ]
+        p = subprocess.Popen(
+            serveo_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid
+        )
+        serveo_host = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            ready, _, _ = select.select([p.stdout], [], [], 0.5)
+            if ready:
+                line = p.stdout.readline()
+                if not line:
+                    continue
+                m = serveo_patterns[0].search(line)
+                if m:
+                    serveo_host = m.group(1).strip()
+                    break
+        if not serveo_host:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except:
+                pass
+        else:
+            print(f"✅ Serveo tunnel established: https://{serveo_host}")
+            tunnel_host = serveo_host
+            tunnel_proc = p
+    else:
+        serveo_host = None
+
+    # 14.8) If Serveo succeeded and in PROD, update Cloudflare CNAME→serveo.net & TXT
+    if serveo_host and host and zone_name:
+        print(f"\n⏳ Updating Cloudflare DNS for {real_domain} (CNAME→serveo.net, TXT→{fingerprint_value}) …")
         update_cloudflare(nc, "serveo.net", fingerprint_value)
+        def reupdate_cf():
+            time.sleep(300)
+            update_cloudflare(nc, "serveo.net", fingerprint_value)
+        threading.Thread(target=reupdate_cf, daemon=True).start()
+    elif host and zone_name:
+        # Serveo failed in prod
+        print("⚠ Serveo failed; skipping Cloudflare update.")
 
-        # Wait ~60 seconds for DNS to propagate
-        print(f"\n⏳ Waiting 60 seconds for DNS to propagate … (Cloudflare TTL is {nc.get('ttl', DEFAULT_TTL)} s)")
-        time.sleep(60)
+    # 14.9) After Serveo (regardless of success), spin up LocalTunnel & fallbacks in parallel using custom subdomain
+    print("\n⏳ Starting LocalTunnel & fallbacks (10s timeout)…\n")
+    def launch_tunnel_chain():
+        global tunnel_host, tunnel_proc
+        lt_host, lt_proc = start_tunnel_chain(
+            timeout=10,
+            app_port=app_port,
+            host=host,
+            zone_name=zone_name
+        )
+        if lt_host:
+            print(f"✅ LocalTunnel/fallback tunnel active: https://{lt_host}")
+            # If we didn’t get a Serveo host, use LT as tunnel_host
+            if not tunnel_host:
+                tunnel_host = lt_host
+                tunnel_proc = lt_proc
+        else:
+            print("⚠ All LocalTunnel-based tunnels failed or timed out.")
 
-    # 13.7) Establish Serveo tunnel (10s timeout) 
-    # DEV: no real_domain passed → random ephemeral. 
-    # PROD: pass real_domain → bind custom domain
-    print("⏳ Starting Serveo tunnel (10s timeout)…")
-    tunnel_host = start_serveo_tunnel(timeout=10, app_port=app_port, real_domain=real_domain)
+    threading.Thread(target=launch_tunnel_chain, daemon=True).start()
 
-    if not tunnel_host:
-        print("⚠ Serveo tunnel failed or timed out. Exiting.")
-        if proc:
-            proc.terminate()
-        sys.exit(1)
-
-    # 13.8) If PROD: schedule a re-update of Cloudflare in 5 minutes 
-    if mode == "prod":
-        threading.Thread(
-            target=lambda: (time.sleep(300), update_cloudflare(nc, "serveo.net", fingerprint_value)),
-            daemon=True
-        ).start()
-
-    # 13.9) Generate TLS certificate for local dev testing
+    # 14.10) Generate TLS certificate for local dev testing (include real_domain or tunnel_host as SANs)
     cert_file = os.path.join(cfg["serve_path"], "cert.pem")
     key_file  = os.path.join(cfg["serve_path"], "key.pem")
-    # In DEV mode, real_domain is None → pass a dummy; we only care about SAN for random tunnel
-    san_domain = tunnel_host if not real_domain else real_domain
-    generate_cert(cert_file, key_file, san_domain, tunnel_host)
+    san_primary = real_domain if real_domain else tunnel_host if tunnel_host else "localhost"
+    san_secondary = tunnel_host if real_domain and tunnel_host else san_primary
+    generate_cert(cert_file, key_file, san_primary, san_secondary)
 
-    # 13.10) Start local dev HTTPS on 9443 → Node
+    # 14.11) Start local dev HTTPS on 9443 → Node
     start_local_https(cert_file, key_file, app_port)
 
-    # 13.11) Print final banner
+    # 14.12) Print final banner
     lan_ip = get_lan_ip()
-    final_domain = san_domain if mode=="prod" else tunnel_host
+    final_domain = real_domain if real_domain else tunnel_host if tunnel_host else "localhost"
     print_banner(lan_ip, final_domain, app_port)
-    print(f"✅ {'Development' if mode=='dev' else 'Production'} will be accessible at: https://{final_domain} (via Serveo → {tunnel_host})\n")
+    print(f"✅ {'Development' if mode=='dev' else 'Production'} is accessible at: https://{final_domain} (via tunnel → {tunnel_host})\n")
     print("⚠ All services started. Press Ctrl+C to terminate.")
 
-    # 13.12) Spawn health-check thread
-    health_thread = threading.Thread(
-        target=lambda: continuous_healthcheck(final_domain, app_port, interval=60),
-        daemon=True
-    )
-    health_thread.start()
+    # 14.13) Start tunnel-health-monitor thread
+    if tunnel_host:
+        check_url = f"https://{tunnel_host}/"
+        monitor_thread = threading.Thread(
+            target=lambda: tunnel_health_monitor(check_url, app_port, nc),
+            daemon=True
+        )
+        monitor_thread.start()
 
-    # 13.13) Block main thread until Ctrl+C
+    # 14.14) Block main thread until Ctrl+C
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nReceived Ctrl+C; shutting down…")
-        if proc:
-            proc.terminate()
-        sys.exit(0)
+        pass
 
 
 if __name__ == "__main__":
